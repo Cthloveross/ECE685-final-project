@@ -1,0 +1,5 @@
+{
+  "hook_layer": 12,
+  "hidden_size": 2048,
+  "sae_features": 16384
+}
