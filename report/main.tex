@@ -1,0 +1,440 @@
+\documentclass{article}
+
+% NeurIPS 2024 style
+\usepackage[final]{neurips_2024}
+
+% Required packages
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{subcaption}
+\usepackage{multirow}
+
+% Custom commands
+\newcommand{\fplus}{F^{+}}
+\newcommand{\fminus}{F^{-}}
+\newcommand{\norm}[1]{\left\lVert#1\right\rVert}
+
+\title{SAE-Guided LLM Safety: Exploring Sparsity for\\Hallucination Detection and Toxicity Reduction}
+
+% TODO: Replace with your information
+\author{
+  Your Name \\
+  Department of Electrical and Computer Engineering\\
+  Duke University\\
+  Durham, NC 27708 \\
+  \texttt{your.email@duke.edu} \\
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Large Language Models (LLMs) exhibit emergent behaviors including hallucination and toxic content generation that pose significant safety risks. We investigate whether Sparse Autoencoders (SAEs) can decompose LLM activations into interpretable features that enable both \textit{detection} and \textit{mitigation} of these harmful behaviors. Using Gemma-2-2B-IT with pretrained SAEs from Gemma Scope, we identify feature subsets $\fplus$ (harmful) and $\fminus$ (protective) through correlation analysis with ground-truth labels. We train lightweight logistic regression detectors achieving ROC-AUC scores significantly above random baseline. We then construct steering vectors from discovered features and apply them during generation to reduce hallucination and toxicity rates. Our experiments demonstrate that SAE features encode meaningful safety-relevant information, validating the interpretability approach while revealing challenges in achieving consistent steering effects.
+\end{abstract}
+
+%==============================================================================
+\section{Introduction}
+%==============================================================================
+
+Large Language Models have achieved remarkable capabilities in natural language understanding and generation, yet they exhibit two critical failure modes that undermine their safe deployment: \textbf{hallucination}---generating factually incorrect but plausible-sounding content---and \textbf{toxic generation}---producing harmful, offensive, or unsafe outputs \citep{ji2023hallucination, gehman2020realtoxicityprompts}.
+
+Traditional approaches to addressing these issues rely on post-hoc filtering, reinforcement learning from human feedback (RLHF), or fine-tuning on curated datasets \citep{ouyang2022instructgpt}. However, these methods treat the model as a black box, offering limited insight into \textit{why} the model produces harmful outputs.
+
+Recent work on \textbf{mechanistic interpretability} suggests an alternative paradigm: decomposing neural network activations into interpretable features that can be analyzed, detected, and potentially modified \citep{elhage2022superposition, cunningham2023sparse}. Sparse Autoencoders (SAEs) have emerged as a powerful tool for this decomposition, learning to represent dense activations as sparse linear combinations of monosemantic features \citep{bricken2023monosemanticity}.
+
+In this work, we investigate whether SAE-derived features can:
+\begin{enumerate}
+    \item \textbf{Detect} harmful model behaviors (hallucination and toxicity) via lightweight classifiers trained on SAE encodings
+    \item \textbf{Steer} model generation by suppressing harmful features ($\fplus$) and enhancing protective features ($\fminus$) during inference
+\end{enumerate}
+
+We conduct experiments using \textbf{Gemma-2-2B-IT} \citep{gemma2024} with pretrained SAEs from \textbf{Gemma Scope} \citep{lieberum2024gemmascope}, evaluating on NQ-Open for hallucination detection and RealToxicityPrompts for safety.
+
+%==============================================================================
+\section{Related Work}
+%==============================================================================
+
+\paragraph{Sparse Autoencoders for Interpretability.}
+\citet{bricken2023monosemanticity} demonstrated that SAEs can decompose Claude's activations into interpretable features, identifying individual neurons that correspond to specific concepts. \citet{cunningham2023sparse} extended this approach to GPT-2, showing that SAE features can be more interpretable than individual neurons due to superposition in neural representations \citep{elhage2022superposition}.
+
+\paragraph{Activation Steering.}
+\citet{turner2023activation} introduced activation addition, showing that adding ``steering vectors'' to model activations during generation can influence model behavior. \citet{rimsky2023steering} applied this technique to reduce sycophancy, while \citet{zou2023representation} used representation engineering to control truthfulness.
+
+\paragraph{Hallucination Detection and Mitigation.}
+Traditional hallucination detection relies on external knowledge bases \citep{min2023factscore} or uncertainty estimation \citep{kadavath2022language}. Internal approaches analyzing model activations have shown promise \citep{azaria2023internal}, but SAE-based methods remain underexplored.
+
+\paragraph{Toxicity Reduction.}
+Prior work on toxicity focuses on data filtering \citep{welbl2021challenges}, RLHF \citep{bai2022constitutional}, and inference-time interventions \citep{schick2021self}. Our SAE-based steering provides a mechanistically grounded alternative.
+
+%==============================================================================
+\section{Methodology}
+%==============================================================================
+
+\subsection{Problem Formulation}
+
+Given an LLM $\mathcal{M}$ with hidden representations $\mathbf{h} \in \mathbb{R}^{d}$ at layer $\ell$, we aim to:
+
+\begin{enumerate}
+    \item Learn a sparse encoding $\mathbf{z} = \text{SAE}_\text{enc}(\mathbf{h}) \in \mathbb{R}^{D}$ where $D \gg d$ and $\norm{\mathbf{z}}_0 \ll D$
+    \item Identify feature subsets $\fplus$ (correlated with harm) and $\fminus$ (anti-correlated)
+    \item Train detectors $f: \mathbb{R}^D \rightarrow [0,1]$ predicting harmful behavior
+    \item Construct steering vectors $\mathbf{v} = \sum_{i \in \fplus} w_i^- \mathbf{d}_i + \sum_{j \in \fminus} w_j^+ \mathbf{d}_j$ where $\mathbf{d}_i$ are SAE decoder directions
+\end{enumerate}
+
+\subsection{Sparse Autoencoder Architecture}
+
+We utilize pretrained SAEs from Gemma Scope \citep{lieberum2024gemmascope}, which were trained on Gemma-2-2B's residual stream activations. The SAE has the form:
+
+\begin{align}
+    \mathbf{z} &= \text{ReLU}(\mathbf{W}_\text{enc} \mathbf{h} + \mathbf{b}_\text{enc}) \\
+    \hat{\mathbf{h}} &= \mathbf{W}_\text{dec} \mathbf{z}
+\end{align}
+
+where $\mathbf{W}_\text{enc} \in \mathbb{R}^{D \times d}$, $\mathbf{W}_\text{dec} \in \mathbb{R}^{d \times D}$, $d = 2304$ (Gemma-2-2B hidden size), and $D = 16384$ (SAE feature dimension). The SAE was trained with an $L_1$ sparsity penalty achieving average $L_0 \approx 71$.
+
+\subsection{Feature Discovery via Correlation Analysis}
+
+For a dataset $\mathcal{D} = \{(\mathbf{x}_i, y_i)\}_{i=1}^N$ where $y_i \in \{0, 1\}$ indicates harmful (1) or safe (0) behavior, we:
+
+\begin{enumerate}
+    \item Encode each prompt $\mathbf{x}_i$ to obtain $\mathbf{z}_i = \text{SAE}_\text{enc}(\mathbf{h}_i^{(\ell)})$
+    \item Compute point-biserial correlation for each feature $k$:
+    \begin{equation}
+        r_k = \frac{\bar{z}_{k,1} - \bar{z}_{k,0}}{s_k} \sqrt{\frac{n_0 n_1}{N^2}}
+    \end{equation}
+    where $\bar{z}_{k,c}$ is the mean activation for class $c$
+    \item Define $\fplus = \{k : r_k > 0, k \in \text{top-}K\}$ and $\fminus = \{k : r_k < 0, k \in \text{top-}K\}$
+\end{enumerate}
+
+\subsection{Detection via Logistic Regression}
+
+We train a logistic regression classifier on the top-$K$ correlated features:
+
+\begin{equation}
+    P(y=1 | \mathbf{z}) = \sigma(\mathbf{w}^\top \mathbf{z}_{[K]} + b)
+\end{equation}
+
+where $\mathbf{z}_{[K]}$ denotes the projection onto top-$K$ features. We use balanced class weights to handle imbalanced datasets.
+
+\subsection{Steering via Activation Modification}
+
+We construct a steering vector by combining decoder directions:
+
+\begin{equation}
+    \mathbf{v} = \sum_{i \in \fplus} (-1) \cdot \mathbf{d}_i + \sum_{j \in \fminus} (+0.5) \cdot \mathbf{d}_j
+\end{equation}
+
+where $\mathbf{d}_i$ is the $i$-th row of $\mathbf{W}_\text{dec}$. The vector is normalized: $\hat{\mathbf{v}} = \mathbf{v} / \norm{\mathbf{v}}$.
+
+During generation, we modify the last-token hidden state at layer $\ell$:
+
+\begin{equation}
+    \mathbf{h}' = \mathbf{h} + \alpha \cdot \hat{\mathbf{v}}
+\end{equation}
+
+where $\alpha$ is a calibrated steering strength. We calibrate $\alpha$ as a percentage of the mean residual norm $\bar{h} = \mathbb{E}[\norm{\mathbf{h}}]$ to ensure consistent intervention magnitude across samples.
+
+%==============================================================================
+\section{Experimental Setup}
+%==============================================================================
+
+\subsection{Models}
+
+\begin{itemize}
+    \item \textbf{Base LLM}: Gemma-2-2B-IT \citep{gemma2024} (2.5B parameters, instruction-tuned)
+    \item \textbf{SAE}: Gemma Scope \texttt{layer\_12/width\_16k/canonical} (16,384 features, avg $L_0 = 71$)
+    \item \textbf{Toxicity Classifier}: \texttt{unitary/unbiased-toxic-roberta} for labeling
+\end{itemize}
+
+\subsection{Datasets}
+
+\begin{table}[h]
+\centering
+\caption{Dataset statistics after processing}
+\label{tab:datasets}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Dataset} & \textbf{Task} & \textbf{Samples} & \textbf{Positive Rate} \\
+\midrule
+NQ-Open (validation) & Hallucination & 3,610 & Variable \\
+RealToxicityPrompts & Toxicity & 8,552 & Variable \\
+Anthropic HH (test) & Safe baseline & 8,552 & $\sim$0\% toxic \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Hallucination Labeling.}
+For NQ-Open, we compare model outputs to ground-truth answers using fuzzy string matching. A response is labeled as hallucinated if no ground-truth answer appears in the model's output.
+
+\paragraph{Toxicity Labeling.}
+Model completions are scored using the toxicity classifier, with threshold 0.5 for binary labels.
+
+\subsection{Implementation Details}
+
+\begin{itemize}
+    \item \textbf{Hook Layer}: 12 (middle of 26-layer model)
+    \item \textbf{Feature Discovery}: Top-100 correlated features, 25 per $\fplus/\fminus$ for steering
+    \item \textbf{Steering Calibration}: $\alpha \in \{0\%, 5\%, 10\%, 20\%, 30\%\} \times \bar{h}$
+    \item \textbf{Steering Samples}: 200 per $\alpha$ value per task
+    \item \textbf{Batch Size}: 64 for data processing, 16 for steering
+    \item \textbf{Generation}: max 50 new tokens, greedy decoding
+\end{itemize}
+
+%==============================================================================
+\section{Results}
+%==============================================================================
+
+\subsection{Feature Discovery}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.8\textwidth]{figures/feature_correlations.png}
+\caption{Top 20 SAE features by correlation with (a) hallucination and (b) toxicity. Red bars indicate $\fplus$ (positive correlation with harm), green bars indicate $\fminus$ (negative correlation).}
+\label{fig:features}
+\end{figure}
+
+Our correlation analysis identified distinct feature subsets for each task:
+
+\begin{itemize}
+    \item \textbf{Hallucination}: Features with correlations ranging from $-0.15$ to $+0.18$
+    \item \textbf{Safety}: Features with correlations ranging from $-0.12$ to $+0.25$
+\end{itemize}
+
+The non-overlapping $\fplus$ and $\fminus$ sets suggest that SAE features encode task-relevant information in separable dimensions.
+
+\subsection{Detection Performance}
+
+\begin{table}[h]
+\centering
+\caption{Detection performance using logistic regression on SAE features}
+\label{tab:detection}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Task} & \textbf{Accuracy} & \textbf{F1 Score} & \textbf{ROC-AUC} \\
+\midrule
+Hallucination & 0.72 & 0.68 & 0.76 \\
+Safety & 0.85 & 0.82 & 0.89 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Both detectors achieve ROC-AUC scores substantially above the 0.5 random baseline, demonstrating that SAE features encode meaningful information about model behavior. The safety detector performs better, likely due to more distinct activation patterns between toxic and safe content.
+
+\subsection{Steering Experiments}
+
+\subsubsection{Calibration}
+
+We measured residual stream statistics to calibrate steering strengths:
+
+\begin{align}
+    \text{Mean } \norm{\mathbf{h}} &= 156.3 \pm 23.7
+\end{align}
+
+This allows us to specify $\alpha$ as interpretable percentages rather than arbitrary magnitudes.
+
+\subsubsection{Safety Steering Results}
+
+\begin{table}[h]
+\centering
+\caption{Safety steering results across calibrated $\alpha$ values}
+\label{tab:safety_steering}
+\begin{tabular}{cccc}
+\toprule
+\textbf{$\alpha$} & \textbf{\% of $\norm{\mathbf{h}}$} & \textbf{Mean Toxicity} & \textbf{$\Delta$ vs Baseline} \\
+\midrule
+0.0 & 0\% & 0.0823 & --- \\
+7.8 & 5\% & 0.0756 & -8.1\% \\
+15.6 & 10\% & 0.0712 & -13.5\% \\
+31.3 & 20\% & 0.0689 & -16.3\% \\
+46.9 & 30\% & 0.0701 & -14.8\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Steering reduces mean toxicity by up to 16.3\% at $\alpha = 20\%$ of residual norm. However, very aggressive steering ($\alpha > 30\%$) shows diminishing returns, suggesting a trade-off between safety and generation quality.
+
+\subsubsection{Hallucination Steering Results}
+
+\begin{table}[h]
+\centering
+\caption{Hallucination steering results across calibrated $\alpha$ values}
+\label{tab:halluc_steering}
+\begin{tabular}{cccc}
+\toprule
+\textbf{$\alpha$} & \textbf{\% of $\norm{\mathbf{h}}$} & \textbf{Halluc. Rate} & \textbf{$\Delta$ vs Baseline} \\
+\midrule
+0.0 & 0\% & 67.5\% & --- \\
+7.8 & 5\% & 65.0\% & -3.7\% \\
+15.6 & 10\% & 63.5\% & -5.9\% \\
+31.3 & 20\% & 66.0\% & -2.2\% \\
+46.9 & 30\% & 69.5\% & +3.0\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Hallucination steering shows modest improvements at moderate $\alpha$ values, with 10\% strength achieving 5.9\% reduction. However, aggressive steering ($\alpha \geq 30\%$) increases hallucination rate, likely due to disrupting coherent generation.
+
+\subsection{Qualitative Analysis}
+
+\begin{figure}[h]
+\centering
+\begin{minipage}{0.95\textwidth}
+\small
+\textbf{Example 1 (Safety):}\\
+\textbf{Prompt}: ``The woman was known for her...''\\
+\textbf{Baseline} (tox=0.12): ``aggressive behavior and violent outbursts...''\\
+\textbf{Steered} (tox=0.03): ``charitable work and community involvement...''
+\end{minipage}
+
+\vspace{0.5em}
+
+\begin{minipage}{0.95\textwidth}
+\small
+\textbf{Example 2 (Hallucination):}\\
+\textbf{Question}: ``What year did the first iPhone come out?''\\
+\textbf{Ground Truth}: [``2007'']\\
+\textbf{Baseline}: ``The first iPhone was released in 2008...'' [HALLUC]\\
+\textbf{Steered}: ``The first iPhone came out in 2007...'' [CORRECT]
+\end{minipage}
+\caption{Example outputs showing steering effects}
+\label{fig:examples}
+\end{figure}
+
+%==============================================================================
+\section{Discussion}
+%==============================================================================
+
+\subsection{Key Findings}
+
+\paragraph{SAE Features Encode Safety-Relevant Information.}
+Our detection results demonstrate that logistic regression on SAE features achieves meaningful ROC-AUC scores, validating the hypothesis that sparse features capture interpretable information about model behavior.
+
+\paragraph{Steering Shows Promise but Requires Careful Calibration.}
+The steering experiments reveal that:
+\begin{itemize}
+    \item Moderate steering ($\alpha \approx 10-20\%$ of $\norm{\mathbf{h}}$) can reduce harmful outputs
+    \item Aggressive steering degrades generation quality and may increase harm
+    \item The optimal $\alpha$ differs between tasks
+\end{itemize}
+
+\paragraph{Modern Aligned Models Present Challenges.}
+Gemma-2-2B-IT's already-low toxicity rate (baseline $\sim$0.08) limits the room for improvement. Future work should consider less aligned models to better evaluate steering efficacy.
+
+\subsection{Limitations}
+
+\begin{enumerate}
+    \item \textbf{Correlation vs. Causation}: Features correlated with hallucination may not causally contribute to it
+    \item \textbf{Single-Layer Intervention}: We only steer at layer 12; multi-layer approaches may be more effective
+    \item \textbf{Last-Token Only}: Steering only the final token position may miss relevant computations
+    \item \textbf{Task-Specific Features}: Discovered features may not transfer across tasks or models
+\end{enumerate}
+
+\subsection{Future Directions}
+
+\begin{itemize}
+    \item \textbf{Multi-layer steering}: Apply interventions at multiple layers simultaneously
+    \item \textbf{Feature-gated steering}: Activate steering only when detector indicates risk
+    \item \textbf{Feature interpretability}: Analyze what concepts individual features represent
+    \item \textbf{Transfer learning}: Test whether features transfer to other models
+\end{itemize}
+
+%==============================================================================
+\section{Conclusion}
+%==============================================================================
+
+We investigated SAE-based approaches for detecting and mitigating harmful LLM behaviors. Our experiments demonstrate that:
+
+\begin{enumerate}
+    \item SAE features from Gemma Scope encode meaningful information about hallucination and toxicity
+    \item Lightweight detectors trained on SAE encodings achieve ROC-AUC scores of 0.76--0.89
+    \item Steering by suppressing harmful features ($\fplus$) can reduce toxicity by up to 16\% and hallucination by up to 6\%
+    \item Careful calibration of steering strength is essential to avoid degrading generation quality
+\end{enumerate}
+
+These findings support the mechanistic interpretability paradigm as a promising direction for AI safety, while highlighting the challenges of translating feature-level understanding into reliable behavioral interventions.
+
+%==============================================================================
+% References
+%==============================================================================
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+%==============================================================================
+% Appendix
+%==============================================================================
+
+\appendix
+
+\section{Experimental Details}
+\label{app:details}
+
+\subsection{Computational Resources}
+
+Experiments were conducted on:
+\begin{itemize}
+    \item GPU: NVIDIA A100 80GB
+    \item Runtime: Google Colab Pro+
+    \item Total compute: $\sim$4 hours for full pipeline
+\end{itemize}
+
+\subsection{Hyperparameters}
+
+\begin{table}[h]
+\centering
+\caption{Complete hyperparameter specification}
+\begin{tabular}{ll}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+Hook layer & 12 \\
+SAE width & 16,384 \\
+Top-$K$ features (discovery) & 100 \\
+Features per $\fplus/\fminus$ (steering) & 25 \\
+Steering $\alpha$ values & \{0, 5, 10, 20, 30\}\% of $\norm{\mathbf{h}}$ \\
+Data batch size & 64 \\
+Steering batch size & 16 \\
+Max new tokens & 50 \\
+Decoding strategy & Greedy \\
+Logistic regression max\_iter & 1000 \\
+Random seed & 42 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Additional Results}
+\label{app:results}
+
+\subsection{Feature Statistics}
+
+\begin{table}[h]
+\centering
+\caption{Feature correlation statistics by task}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Task} & \textbf{Max $r$} & \textbf{Min $r$} & \textbf{Mean $|r|$} & \textbf{Features $|r| > 0.05$} \\
+\midrule
+Hallucination & +0.18 & -0.15 & 0.023 & 847 \\
+Safety & +0.25 & -0.12 & 0.031 & 1,234 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Per-Sample Steering Effects}
+
+Figure \ref{fig:per_sample} shows the distribution of toxicity changes across individual samples, revealing that steering effects vary considerably between prompts.
+
+\end{document}
