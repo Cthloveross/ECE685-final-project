@@ -400,13 +400,16 @@ Experiments were conducted on:
 \toprule
 \textbf{Parameter} & \textbf{Value} \\
 \midrule
-Hook layer & 12 \\
+Hook layer (Gemma) & 12 \\
+Hook layer (Llama) & 31 \\
 SAE width & 16,384 \\
 Top-$K$ features (discovery) & 100 \\
 Features per $\fplus/\fminus$ (steering) & 25 \\
 Steering $\alpha$ values & \{0, 5, 10, 20, 30\}\% of $\norm{\mathbf{h}}$ \\
-Data batch size & 64 \\
-Steering batch size & 16 \\
+Data batch size (Gemma) & 64 \\
+Data batch size (Llama) & 128 \\
+Steering batch size (Gemma) & 16 \\
+Steering batch size (Llama) & 32 \\
 Max new tokens & 50 \\
 Decoding strategy & Greedy \\
 Logistic regression max\_iter & 1000 \\
@@ -436,5 +439,21 @@ Safety & +0.25 & -0.12 & 0.031 & 1,234 \\
 \subsection{Per-Sample Steering Effects}
 
 Figure \ref{fig:per_sample} shows the distribution of toxicity changes across individual samples, revealing that steering effects vary considerably between prompts.
+\subsection{Llama-3.1-8B Experiments (Added)}
+
+Following the Gemma-2-2B experiments, we ran an equivalent set of experiments on \textbf{Llama-3.1-8B-Instruct} using pretrained SAEs from the Llama Scope (OpenMOSS). Key implementation details that differ from the Gemma runs are:
+
+\begin{itemize}
+    \item \textbf{Hook layer}: layer 31 (Llama has 32 transformer blocks; we capture the residual stream at block index 31)
+    \item \textbf{Hidden size}: $d=4096$ (Llama-3.1-8B internal hidden dimension)
+    \item \textbf{SAE source}: OpenMOSS / Llama Scope (safetensors checkpoints, layer 31 SAE)
+    \item \textbf{Batching}: larger data batch size for activation capture (typical `data_batch_size=128`) and `steering_batch_size=32` to better utilize GPU memory on the A100
+    \item \textbf{Calibration}: steering strengths $\alpha$ are computed by measuring the mean residual norm $\bar{h}$ across calibration prompts and converting fractional ratios (e.g., 5%, 10%, 20%, 30%) into absolute $\alpha$ values per the notebooks' `calibrate_steering_strengths` routine
+    \item \textbf{SAE handling}: weights are loaded from OpenMOSS safetensors and transposed/inferred as needed to obtain encoder/decoder matrices compatible with our `encode`/`decode` wrappers
+\end{itemize}
+
+The Llama notebook saves a comprehensive visualization (`calibrated_steering_results.png`) with detection metrics, steering analyses, and per-α plots. Those visualizations and the `comprehensive_results.png` are produced during the calibrated steering analysis and can be found in the repository root (or the notebook output directory) when the notebook is executed.
+
+Qualitatively, the Llama-3.1-8B experiments reproduce the main patterns observed with Gemma: SAE features contain interpretable signals for detection, and calibrated moderate steering (e.g., 5–20% of $\norm{\mathbf{h}}$) can reduce harmful outputs without catastrophic degradation. For Llama-3.1-8B-Instruct the notebooks report that the model is already highly aligned with a low baseline toxicity rate, which limits measurable toxicity reduction; hallucination reductions are modest and vary with steering strength.
 
 \end{document}
